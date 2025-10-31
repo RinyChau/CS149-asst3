@@ -27,6 +27,34 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+__global__ void up_sweep_kernel(int N, int stride, int work_items, int* result) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(index >= work_items) return;
+    // if(index >=N) return;
+    int left = index * stride * 2 + stride - 1;
+    int right = (index + 1) * stride * 2 -1;
+    if(right>=N) return;
+    result[right] += result[left];
+}
+
+__global__ void down_sweep_kernel(int N, int stride, int work_items, int* result) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if(index>=work_items) return;
+    // if(index >= N) return;
+    // if(index == N-1 && stride == N /2) result[N-1] = 0;
+    int left = index * stride * 2 + stride - 1;
+    int right = (index + 1) * stride * 2 -1;
+    if(right>=N) return;
+    int tmp = result[right];
+    result[right] += result[left];
+    result[left] = tmp;
+}
+
+__global__ void set_last_zero(int N, int* result) {
+    result[N-1] = 0;
+}
+
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -53,8 +81,29 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
+    int rounded_length = nextPow2(N);
+    if(rounded_length > N) cudaMemset(result + N, 0, sizeof(int) * (rounded_length-N));
+    // cudaDeviceSynchronize();
+    
+    for(int stride=1; stride<=(rounded_length/2); stride*=2)
+    {
+        int threads = rounded_length / (stride*2);
+        int blocks = (threads + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK;
+        up_sweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(rounded_length, stride, threads,result);
+        // cudaDeviceSynchronize();
+    }
+    
+    set_last_zero<<<1, 1>>>(rounded_length, result);
+    // cudaDeviceSynchronize();
 
-
+    for(int stride=(rounded_length/2); stride>=1;stride/=2)
+    {
+        int threads = rounded_length / (stride*2);
+        int blocks = (threads + THREADS_PER_BLOCK - 1)/THREADS_PER_BLOCK;
+        down_sweep_kernel<<<blocks, THREADS_PER_BLOCK>>>(rounded_length, stride, threads, result);
+        // cudaDeviceSynchronize();
+    }
+    // cudaDeviceSynchronize();
 }
 
 
@@ -140,6 +189,20 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     return overallDuration; 
 }
 
+__global__ void repeat_flags_kernel(int N, int* input, int* output) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i>=N) return;
+    output[i] = 0;
+    if(i>=N-1) return;
+    output[i] = input[i] == input[i+1];
+
+}
+
+__global__ void repeat_rearrange_kernel(int N, int* flags, int* scan_result, int* output){
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i>=N) return;
+    if(flags[i]) output[scan_result[i]] = i;
+}
 
 // find_repeats --
 //
@@ -160,8 +223,36 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+    int threads = nextPow2(length);
+    
+    int* flag_result;
+    int* scan_result;
+    cudaMalloc((void **)&flag_result, sizeof(int) * threads);
+    cudaMalloc((void **)&scan_result, sizeof(int) * threads);
 
-    return 0; 
+    int blocks = (length + THREADS_PER_BLOCK -1)/THREADS_PER_BLOCK;
+    repeat_flags_kernel<<<blocks,THREADS_PER_BLOCK>>>(length, device_input, flag_result);
+    // cudaDeviceSynchronize();
+    
+    cudaMemcpy(scan_result, flag_result, sizeof(int) * length, cudaMemcpyDeviceToDevice);
+
+    exclusive_scan(flag_result, length, scan_result);
+    // cudaDeviceSynchronize();
+
+
+    repeat_rearrange_kernel<<<blocks,THREADS_PER_BLOCK>>>(length, flag_result, scan_result, device_output);
+
+    int count = 0;
+    cudaMemcpy(&count, &scan_result[length - 1], sizeof(int), cudaMemcpyDeviceToHost);
+
+
+
+    cudaFree(flag_result);
+    cudaFree(scan_result);
+
+
+
+    return count; 
 }
 
 
