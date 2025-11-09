@@ -745,6 +745,25 @@ void print_cuda_array(T* deviceArray, int N, std::string title, int maxSize=10){
 
 
 __device__ __inline__ int
+circleInBoxConservative(
+    float circleX, float circleY, float circleRadius,
+    float boxL, float boxR, float boxT, float boxB)
+{
+
+    // expand box by circle radius.  Test if circle center is in the
+    // expanded box.
+
+    if ( circleX >= (boxL - circleRadius) &&
+         circleX <= (boxR + circleRadius) &&
+         circleY >= (boxB - circleRadius) &&
+         circleY <= (boxT + circleRadius) ) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+__device__ __inline__ int
 circleInBox(
     float circleX, float circleY, float circleRadius,
     float boxL, float boxR, float boxT, float boxB)
@@ -844,7 +863,8 @@ __global__ void tile_circle_pair(int tw, int th, int* pos, long long* output){
     // long long l_ci = (long long)ci << 32;
     for(short tx=screenMinX/tw; tx<max_tx; tx++){
         for(short ty=screenMinY/th; ty<max_ty; ty++){
-            if(circleInBox(p.x, p.y, rad, tx*tw*invWidth, (tx+1)*tw*invWidth, (ty+1)*th*invHeight, ty*th*invHeight)){
+            float l = tx*tw*invWidth, r = (tx+1)*tw*invWidth, t = (ty+1)*th*invHeight, b = ty*th*invHeight;
+            if(circleInBox(p.x, p.y, rad, l, r, t, b)){
                 long long ti = ty * twc + tx;
                 output[output_i++] = (ti << 32) + ci;
             }
@@ -1256,7 +1276,7 @@ __global__ void fill_circle_index(int N, int *tileOffset, int* circleIndex){
         __syncthreads();
         if(isValidTi){
             for(int j=0;j<batch_size;j++){
-                if(circleInBox(px[j], py[j], rad[j], l, r, t, b)){
+                if(circleInBoxConservative(px[j], py[j], rad[j], l, r, t, b) && circleInBox(px[j], py[j], rad[j], l, r, t, b)){
                     circleIndex[offset++] = ci+j;
                 }
             }
