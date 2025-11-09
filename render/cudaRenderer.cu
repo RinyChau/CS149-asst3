@@ -3,16 +3,49 @@
 #include <math.h>
 #include <stdio.h>
 #include <vector>
+#include <iostream>
 
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <driver_functions.h>
+
+#include <thrust/scan.h>
+#include <thrust/sort.h>
+#include <thrust/device_ptr.h>
+#include <thrust/device_malloc.h>
+#include <thrust/device_free.h>
+
+#define TILE_X 16
+#define TILE_Y 16
+#define THREADS_PER_BLK (TILE_X * TILE_Y)
+
 
 #include "cudaRenderer.h"
 #include "image.h"
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
+#include "cycleTimer.h"
+#include "exclusiveScan.cu_inl"
+
+
+
+#define DEBUG
+
+#ifdef DEBUG
+#define cudaCheckError(ans) { cudaAssert((ans), __FILE__, __LINE__); }
+inline void cudaAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess)
+   {
+      fprintf(stderr, "CUDA Error: %s at %s:%d\n",
+        cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
+#else
+#define cudaCheckError(ans) ans
+#endif
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -444,6 +477,21 @@ CudaRenderer::CudaRenderer() {
     cudaDeviceColor = NULL;
     cudaDeviceRadius = NULL;
     cudaDeviceImageData = NULL;
+    
+    cudaDeviceTileCnt=NULL;
+    cudaDeviceTileOffset=NULL;
+    cudaDeviceCircleIndex=NULL;
+    cudaDeviceTileCirclePair=NULL;
+
+    cudaDeviceCircleCnt=NULL;
+    cudaDeviceCircleOffset=NULL;
+    
+    useTileBased=false;
+
+    cudaDeviceStart=NULL;
+    cudaDeviceEnd=NULL;
+    // cudaStreamCreate(&stream);
+    // cudaDeviceTileOffset=NULL;
 }
 
 CudaRenderer::~CudaRenderer() {
@@ -465,7 +513,21 @@ CudaRenderer::~CudaRenderer() {
         cudaFree(cudaDeviceColor);
         cudaFree(cudaDeviceRadius);
         cudaFree(cudaDeviceImageData);
+        if(useTileBased){
+            cudaFree(cudaDeviceTileCnt);
+            cudaFree(cudaDeviceTileOffset);
+            cudaFree(cudaDeviceCircleIndex);
+        }
+        else{
+            cudaFree(cudaDeviceCircleCnt);
+            cudaFree(cudaDeviceCircleOffset);
+            cudaFree(cudaDeviceStart);
+            cudaFree(cudaDeviceEnd);
+            cudaFree(cudaDeviceTileCirclePair);
+        }
     }
+    // cudaStreamSynchronize(stream); 
+    // cudaStreamDestroy(stream);
 }
 
 const Image*
@@ -525,6 +587,40 @@ CudaRenderer::setup() {
     cudaMalloc(&cudaDeviceColor, sizeof(float) * 3 * numCircles);
     cudaMalloc(&cudaDeviceRadius, sizeof(float) * numCircles);
     cudaMalloc(&cudaDeviceImageData, sizeof(float) * 4 * image->width * image->height);
+
+
+    // malloc my data
+    // cudaMalloc(&tileCnt, sizeof(int) * numCircles);
+    useTileBased = numCircles <=2000;
+    int tw=TILE_X, th=TILE_Y;
+    int width = image->width;
+    int height = image->height;
+    int thc = (height+th-1)/th;
+    int twc = (width+tw-1)/tw;
+    int total_tile_count = thc * twc;
+    if(useTileBased){
+        cudaMalloc(&cudaDeviceTileCnt, sizeof(int) * total_tile_count);
+        // printf("start malloc cudaDeviceTileOffset\n");
+        cudaMalloc(&cudaDeviceTileOffset, sizeof(int) * total_tile_count);
+        cudaMalloc(&cudaDeviceCircleIndex, sizeof(int) * 2048 * 1000);
+        // printf("end malloc cudaDeviceTileOffset\n");
+    }else{
+        cudaMalloc(&cudaDeviceCircleCnt, sizeof(int)*numCircles);
+        cudaMalloc(&cudaDeviceCircleOffset, sizeof(int)*numCircles);
+        cudaMalloc(&cudaDeviceTileCirclePair, sizeof(int)*1024*1024*100);
+        cudaMalloc(&cudaDeviceStart, sizeof(int)*total_tile_count);
+        cudaMalloc(&cudaDeviceEnd, sizeof(int)*total_tile_count);
+    }
+
+    // else{
+    //     cudaMalloc(&tileCnt, sizeof(int) * numCircles);
+    // }
+
+    // printf("width:%d, height%d\n", width, height);
+    // cudaCheckError(cudaMalloc(&start, sizeof(int) * total_tile_count));
+    // cudaCheckError(cudaMalloc(&end, sizeof(int) * total_tile_count));
+    
+
 
     cudaMemcpy(cudaDevicePosition, position, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
     cudaMemcpy(cudaDeviceVelocity, velocity, sizeof(float) * 3 * numCircles, cudaMemcpyHostToDevice);
@@ -633,13 +729,644 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
+template<typename T>
+void print_cuda_array(T* deviceArray, int N, std::string title, int maxSize=10){
+    T* hostArray = new T[N];
+    cudaMemcpy(hostArray, deviceArray, sizeof(T) * N, cudaMemcpyDeviceToHost);
+    std::cout<<"**********" << title << "**********\n";
+    std::cout<< "Count: " << N << ", array: ";
+    for(int i=0; i<N && i<maxSize;i++){
+        std::cout<<hostArray[i] << ", ";
+    }
+    std::cout<<std::endl;
+    std::cout<<"**************************\n";
+    delete[] hostArray;
+}
+
+
+__device__ __inline__ int
+circleInBox(
+    float circleX, float circleY, float circleRadius,
+    float boxL, float boxR, float boxT, float boxB)
+{
+
+    // clamp circle center to box (finds the closest point on the box)
+    float closestX = (circleX > boxL) ? ((circleX < boxR) ? circleX : boxR) : boxL;
+    float closestY = (circleY > boxB) ? ((circleY < boxT) ? circleY : boxT) : boxB;
+
+    // is circle radius less than the distance to the closest point on
+    // the box?
+    float distX = closestX - circleX;
+    float distY = closestY - circleY;
+
+    if ( ((distX*distX) + (distY*distY)) <= (circleRadius*circleRadius) ) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+
+__global__ void count_tiles_per_circle(int tw, int th, int* circleCnt){
+    int ci = blockIdx.x * blockDim.x + threadIdx.x;
+    int ci3 = 3*ci;
+
+    if (ci >= cuConstRendererParams.numCircles)
+        return;
+
+    // read position and radius
+    float3 p = *(float3*)(&cuConstRendererParams.position[ci3]);
+    float  rad = cuConstRendererParams.radius[ci];
+
+    // compute the bounding box of the circle. The bound is in integer
+    // screen coordinates, so it's clamped to the edges of the screen.
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    short minX = static_cast<short>(imageWidth * (p.x - rad));
+    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+    short minY = static_cast<short>(imageHeight * (p.y - rad));
+    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+
+    // a bunch of clamps.  Is there a CUDA built-in for this?
+    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+    
+    short max_tx = (screenMaxX + tw - 1) / tw;
+    short max_ty = (screenMaxY + th - 1) / th;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    circleCnt[ci] = 0;
+    for(short tx=screenMinX/tw; tx<max_tx; tx++){
+        for(short ty=screenMinY/th; ty<max_ty; ty++){
+            if(circleInBox(p.x, p.y, rad, tx*tw*invWidth, (tx+1)*tw*invWidth, (ty+1)*th*invHeight, ty*th*invHeight)){
+                circleCnt[ci] += 1;
+            }
+        }
+    }
+
+}
+
+__global__ void tile_circle_pair(int tw, int th, int* pos, long long* output){
+    int ci = blockIdx.x * blockDim.x + threadIdx.x;
+    int ci3 = 3*ci;
+
+    if (ci >= cuConstRendererParams.numCircles)
+        return;
+
+    // read position and radius
+    float3 p = *(float3*)(&cuConstRendererParams.position[ci3]);
+    float  rad = cuConstRendererParams.radius[ci];
+
+    // compute the bounding box of the circle. The bound is in integer
+    // screen coordinates, so it's clamped to the edges of the screen.
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    short minX = static_cast<short>(imageWidth * (p.x - rad));
+    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+    short minY = static_cast<short>(imageHeight * (p.y - rad));
+    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+
+    // a bunch of clamps.  Is there a CUDA built-in for this?
+    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+    
+    short max_tx = (screenMaxX + tw - 1) / tw;
+    short max_ty = (screenMaxY + th - 1) / th;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    // 计算横向tile的数量
+    int twc = (imageWidth + tw -1)/tw;
+    int output_i = pos[ci];
+    // long long l_ci = (long long)ci << 32;
+    for(short tx=screenMinX/tw; tx<max_tx; tx++){
+        for(short ty=screenMinY/th; ty<max_ty; ty++){
+            if(circleInBox(p.x, p.y, rad, tx*tw*invWidth, (tx+1)*tw*invWidth, (ty+1)*th*invHeight, ty*th*invHeight)){
+                long long ti = ty * twc + tx;
+                output[output_i++] = (ti << 32) + ci;
+            }
+        }
+    }
+}
+
+
+
+__global__ void find_start_end_index(int N, long long* value, int* start, int* end){
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if(i>=N) return;
+    int ti = value[i] >> 32;
+    if(i==0){
+        start[ti] = 0;
+    }
+    else{
+        int prev_ti = value[i-1] >> 32;
+        if(ti != prev_ti){
+            start[ti] = i;
+            end[prev_ti] = i;
+        }
+    }
+    if(i==N-1) end[ti] = N;
+}
+
+
+__device__ __inline__ void
+shadeSnow(float rad, float2 pixelCenter, float3 p, float4* colorPtr) {
+
+    float diffX = p.x - pixelCenter.x;
+    float diffY = p.y - pixelCenter.y;
+    float pixelDist = diffX * diffX + diffY * diffY;
+
+    // float rad = cuConstRendererParams.radius[circleIndex];;
+    float maxDist = rad * rad;
+
+    // circle does not contribute to the image
+    if (pixelDist > maxDist)
+        return;
+
+    float3 rgb;
+    float alpha;
+
+    // there is a non-zero contribution.  Now compute the shading value
+
+    // suggestion: This conditional is in the inner loop.  Although it
+    // will evaluate the same for all threads, there is overhead in
+    // setting up the lane masks etc to implement the conditional.  It
+    // would be wise to perform this logic outside of the loop next in
+    // kernelRenderCircles.  (If feeling good about yourself, you
+    // could use some specialized template magic).
+    const float kCircleMaxAlpha = .5f;
+    const float falloffScale = 4.f;
+
+    float normPixelDist = sqrt(pixelDist) / rad;
+    rgb = lookupColor(normPixelDist);
+
+    float maxAlpha = .6f + .4f * (1.f-p.z);
+    maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+    alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
+
+    float oneMinusAlpha = 1.f - alpha;
+
+    // BEGIN SHOULD-BE-ATOMIC REGION
+    // global memory read
+    float4 existingColor = *colorPtr;
+    float4 newColor;
+    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
+    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
+    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
+    newColor.w = alpha + existingColor.w;
+    *colorPtr = newColor;
+
+    // END SHOULD-BE-ATOMIC REGION
+}
+
+__device__ __inline__ void
+shadeNormal(float rad, float3 rgb, float2 pixelCenter, float3 p, float4* colorPtr) {
+
+    float diffX = p.x - pixelCenter.x;
+    float diffY = p.y - pixelCenter.y;
+    float pixelDist = diffX * diffX + diffY * diffY;
+
+    // float rad = cuConstRendererParams.radius[circleIndex];
+    float maxDist = rad * rad;
+
+    // circle does not contribute to the image
+    if (pixelDist > maxDist)
+        return;
+
+    // float3 rgb;
+    float alpha;
+
+    // there is a non-zero contribution.  Now compute the shading value
+
+    // suggestion: This conditional is in the inner loop.  Although it
+    // will evaluate the same for all threads, there is overhead in
+    // setting up the lane masks etc to implement the conditional.  It
+    // would be wise to perform this logic outside of the loop next in
+    // kernelRenderCircles.  (If feeling good about yourself, you
+    // could use some specialized template magic).
+    // simple: each circle has an assigned color
+    // int index3 = 3 * circleIndex;
+    // rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+    alpha = .5f;
+
+    float oneMinusAlpha = 1.f - alpha;
+
+    // BEGIN SHOULD-BE-ATOMIC REGION
+    // global memory read
+    float4 existingColor = *colorPtr;
+    float4 newColor;
+    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
+    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
+    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
+    newColor.w = alpha + existingColor.w;
+
+    *colorPtr = newColor;
+
+    // END SHOULD-BE-ATOMIC REGION
+}
+
+template<bool isSnow>
+__global__ void kernelRenderPixels() {
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    short w = cuConstRendererParams.imageWidth;
+    short h = cuConstRendererParams.imageHeight;
+    if(i >=w*h) return;
+    int numCircles = cuConstRendererParams.numCircles;
+    int x = i%w;
+    int y= i/w;
+    float invWidth = 1.f / w;
+    float invHeight = 1.f / h;
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (y*w+x)]);
+
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(x) + 0.5f),
+                                    invHeight * (static_cast<float>(y) + 0.5f));
+    float4 existColor = *imgPtr;
+    for(int ci=0;ci<numCircles;ci++){
+        int ci3 = ci*3;
+        float3 p = *(float3*)(&cuConstRendererParams.position[ci3]);
+        float  rad = cuConstRendererParams.radius[ci];
+        float3 rgb = *(float3*)&(cuConstRendererParams.color[ci3]);
+        
+        if(isSnow){
+            shadeSnow(rad, pixelCenterNorm, p, &existColor);
+        }
+        else{
+            shadeNormal(rad, rgb, pixelCenterNorm, p, &existColor);
+        }
+    }
+    *imgPtr = existColor;
+}
+
+template<bool isSnow>
+__global__ void render_tile(int* start, int* end, long long* pair){
+    short w = cuConstRendererParams.imageWidth;
+    short h = cuConstRendererParams.imageHeight;
+    short tw=blockDim.x, th=blockDim.y;
+    short tx=blockIdx.x, ty=blockIdx.y;
+    short twc=gridDim.x;
+    short x = tx * tw + threadIdx.x;
+    short y = ty * th + threadIdx.y;
+    if(x>=w||y>=h) return;
+    int ti = ty*twc+tx;
+
+    if(start[ti]<0) return;
+    // printf("x: %d, y:%d\n", x, y);
+    float invWidth = 1.f / w;
+    float invHeight = 1.f / h;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(x) + 0.5f), invHeight * (static_cast<float>(y) + 0.5f));
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (y * w + x)]);
+    float4 existColor = *imgPtr;
+    __shared__ float3 p_shared[THREADS_PER_BLK];
+    __shared__ float rad_shared[THREADS_PER_BLK];
+    __shared__ float3 rgb_shared[THREADS_PER_BLK];
+
+    int e = end[ti];
+    int locali = threadIdx.y * tw + threadIdx.x;
+    for(int i=start[ti];i<e;i+=THREADS_PER_BLK){
+        int batch_size = min(THREADS_PER_BLK, e-i);
+        if(locali<batch_size){
+            int ci = pair[i+locali];
+            int ci3 = ci*3;
+            p_shared[locali] = *(float3*)(&cuConstRendererParams.position[ci3]);
+            rad_shared[locali] = cuConstRendererParams.radius[ci];
+            rgb_shared[locali] = *(float3*)&(cuConstRendererParams.color[ci3]);
+        }
+        __syncthreads();
+        
+        for(int j=0;j<batch_size;j++){
+            if(isSnow){
+                shadeSnow(rad_shared[j], pixelCenterNorm, p_shared[j], &existColor);
+            }
+            else{
+                shadeNormal(rad_shared[j], rgb_shared[j], pixelCenterNorm, p_shared[j], &existColor);
+            }
+        }
+        __syncthreads();
+        
+    }
+    *imgPtr = existColor;
+}
+
+template<bool isSnow>
+__global__ void render_tile_pixel(){
+    short w = cuConstRendererParams.imageWidth;
+    short h = cuConstRendererParams.imageHeight;
+    short tw=blockDim.x, th=blockDim.y;
+    short tx=blockIdx.x, ty=blockIdx.y;
+    short x = tx * tw + threadIdx.x;
+    short y = ty * th + threadIdx.y;
+    if(x>=w||y>=h) return;
+
+    float invWidth = 1.f / w;
+    float invHeight = 1.f / h;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(x) + 0.5f), invHeight * (static_cast<float>(y) + 0.5f));
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (y * w + x)]);
+    float4 existColor = *imgPtr;
+    __shared__ int is_intersect[THREADS_PER_BLK];
+    __shared__ float3 p_shared[THREADS_PER_BLK];
+    __shared__ float rad_shared[THREADS_PER_BLK];
+    __shared__ float3 rgb_shared[THREADS_PER_BLK];
+    int locali = threadIdx.y * tw + threadIdx.x;
+    int numCircles = cuConstRendererParams.numCircles;
+    for(int i=0;i<numCircles;i+=THREADS_PER_BLK){
+        int batch_size = min(THREADS_PER_BLK, numCircles-i);
+        if(locali<batch_size){
+            int ci = i+locali;
+            int ci3 = ci*3;
+            p_shared[locali] = *(float3*)(&cuConstRendererParams.position[ci3]);
+            rad_shared[locali] = cuConstRendererParams.radius[ci];
+            is_intersect[locali] = circleInBox(p_shared[locali].x, p_shared[locali].y, rad_shared[locali], tx*tw*invWidth, (tx+1)*tw*invWidth, (ty+1)*th*invHeight, ty*th*invHeight);
+            if(is_intersect[locali]) rgb_shared[locali] = *(float3*)&(cuConstRendererParams.color[ci3]);
+        }
+        __syncthreads();
+        
+        for(int j=0;j<batch_size;j++){
+            if(is_intersect[j]){
+                if(isSnow){
+                    shadeSnow(rad_shared[j], pixelCenterNorm, p_shared[j], &existColor);
+                }
+                else{
+                    shadeNormal(rad_shared[j], rgb_shared[j], pixelCenterNorm, p_shared[j], &existColor);
+                }
+            }
+
+        }
+        __syncthreads();
+        
+    }
+    *imgPtr = existColor;
+}
+
+void CudaRenderer::render_sorted_pairs(){
+
+    bool isSnow = sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME;
+    int width = image->width;
+    int height = image->height;
+    int blockSize = THREADS_PER_BLK;
+
+    // tile width, tile height
+    int tw=TILE_X , th=TILE_Y;
+    // tile height count, tile width count
+    int thc = (height+th-1)/th;
+    int twc = (width+tw-1)/tw;
+    int total_tile_count = thc * twc;
+    dim3 blockDim(tw, th);
+    dim3 gridDim(twc, thc);
+    
+
+    int circleThreads = (numCircles + blockSize -1) / blockSize;
+    count_tiles_per_circle<<<circleThreads, blockSize>>>(tw, th, cudaDeviceCircleCnt);
+
+
+
+    //使用exclusive scan 计算每个circle对应的起始位置
+    // 0.1ms
+    thrust::device_ptr<int> circle_cnt_ptr(cudaDeviceCircleCnt);
+    thrust::device_ptr<int> circle_offset_ptr(cudaDeviceCircleOffset);
+    thrust::exclusive_scan(circle_cnt_ptr, circle_cnt_ptr + numCircles, circle_offset_ptr);
+
+
+    // 获取相交的tile数量
+    // 0.03 实在不行可以考虑优化
+    int lastCircle, prevCircle;
+    cudaMemcpy(&lastCircle, cudaDeviceCircleCnt + numCircles-1, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&prevCircle, cudaDeviceCircleOffset+numCircles-1, sizeof(int), cudaMemcpyDeviceToHost);
+    int totalPair = prevCircle + lastCircle;
+    // long long* tileCirclePair;
+    // 获取(tile_id, circle_id)的数据。
+    // cudaMalloc(&tileCirclePair, sizeof(long long) * totalPair);
+
+    
+    // 0.04
+    tile_circle_pair<<<circleThreads, blockSize>>>(tw, th, cudaDeviceCircleOffset, cudaDeviceTileCirclePair);
+
+    // 0.45ms 
+    thrust::device_ptr<long long> tile_circle_ptr(cudaDeviceTileCirclePair);
+    thrust::sort(tile_circle_ptr, tile_circle_ptr+totalPair);
+
+    
+    cudaMemset(cudaDeviceStart, -1, sizeof(int) * total_tile_count);
+    cudaMemset(cudaDeviceEnd, -1, sizeof(int) * total_tile_count);
+    find_start_end_index<<<(totalPair + blockSize - 1)/blockSize,blockSize>>>(totalPair, cudaDeviceTileCirclePair, cudaDeviceStart, cudaDeviceEnd);
+
+    
+    if(isSnow){
+        render_tile<true><<<gridDim, blockDim>>>(cudaDeviceStart, cudaDeviceEnd, cudaDeviceTileCirclePair);
+    }
+    else{
+        render_tile<false><<<gridDim, blockDim>>>(cudaDeviceStart, cudaDeviceEnd, cudaDeviceTileCirclePair);
+    }
+
+    // cudaFree(tileCirclePair);
+}
+
+
+void CudaRenderer::render_pixel_parallel(){
+    bool isSnow = sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME;
+    int width = image->width;
+    int height = image->height;
+    int blockSize = THREADS_PER_BLK;
+    if(isSnow){
+        kernelRenderPixels<true><<<(width*height+blockSize-1)/blockSize, blockSize>>>();
+    }
+    else{
+        kernelRenderPixels<false><<<(width*height+blockSize-1)/blockSize, blockSize>>>();
+    }
+}
+
+__global__ void count_circles_per_tile(int tw, int th, int* tileCnt){
+    int ci = blockIdx.x * blockDim.x + threadIdx.x;
+    int ci3 = 3*ci;
+
+    if (ci >= cuConstRendererParams.numCircles)
+        return;
+
+    // read position and radius
+    float3 p = *(float3*)(&cuConstRendererParams.position[ci3]);
+    float  rad = cuConstRendererParams.radius[ci];
+
+    // compute the bounding box of the circle. The bound is in integer
+    // screen coordinates, so it's clamped to the edges of the screen.
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    // 在这种情况，如果取整，可能有时候会漏掉一些边界的，所以最好扩大一点边界。
+    short minX = static_cast<short>(imageWidth * (p.x - rad))-1;
+    short maxX = static_cast<short>(imageWidth * (p.x + rad))+2;
+    short minY = static_cast<short>(imageHeight * (p.y - rad))-1;
+    short maxY = static_cast<short>(imageHeight * (p.y + rad))+2;
+
+    // a bunch of clamps.  Is there a CUDA built-in for this?
+    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+    
+    short max_tx = (screenMaxX + tw - 1) / tw;
+    short max_ty = (screenMaxY + th - 1) / th;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+
+    int twc = (imageWidth + tw -1)/tw;
+    for(int ty=screenMinY/th; ty<max_ty; ty++){
+        for(int tx=screenMinX/tw; tx<max_tx; tx++){
+            float l=tx*tw*invWidth, r=(tx+1)*tw*invWidth, t=(ty+1)*th*invHeight, b=ty*th*invHeight;
+            if(circleInBox(p.x, p.y, rad, l, r, t, b)){
+                // int ti = ty*twc+tx;
+                atomicAdd(&tileCnt[ty*twc+tx], 1);
+                // tileCnt[ci] += 1;
+            }
+        }
+    }
+
+}
+
+__global__ void fill_circle_index(int N, int *tileOffset, int* circleIndex){
+
+
+    int ti = blockIdx.x * blockDim.x + threadIdx.x;
+    bool isValidTi = ti<N;
+    // if(ti>=N) return;
+
+    // tile width, tile height
+    short tw=TILE_X , th=TILE_Y;
+    short w = cuConstRendererParams.imageWidth;
+    short h = cuConstRendererParams.imageHeight;
+    short twc = (w+tw-1)/tw;
+    short tx = ti%twc, ty = ti/twc;
+    float invWidth = 1.f / w;
+    float invHeight = 1.f / h;
+
+    int offset = isValidTi ? tileOffset[ti] : 0;
+    float l=tx*tw*invWidth, r=(tx+1)*tw*invWidth, t=(ty+1)*th*invHeight, b=ty*th*invHeight;
+    __shared__ float px[THREADS_PER_BLK], py[THREADS_PER_BLK], rad[THREADS_PER_BLK];
+    int locali = threadIdx.x;
+    int e = cuConstRendererParams.numCircles;
+    for(int ci=0;ci<e;ci+=THREADS_PER_BLK){
+        int batch_size = min(THREADS_PER_BLK, e-ci);
+        int ci3 = (ci+locali)*3;
+        if(locali<batch_size){
+            px[locali] = cuConstRendererParams.position[ci3];
+            py[locali] = cuConstRendererParams.position[ci3+1];
+            rad[locali] = cuConstRendererParams.radius[ci+locali];
+        }
+        __syncthreads();
+        if(isValidTi){
+            for(int j=0;j<batch_size;j++){
+                if(circleInBox(px[j], py[j], rad[j], l, r, t, b)){
+                    circleIndex[offset++] = ci+j;
+                }
+            }
+        }
+        __syncthreads();
+
+    }
+}
+
+
+template<bool isSnow>
+__global__ void render_tile2(int* tileCnt, int* tileOffset, int* circleIndex){
+    short w = cuConstRendererParams.imageWidth;
+    short h = cuConstRendererParams.imageHeight;
+    short tw=blockDim.x, th=blockDim.y;
+    short tx=blockIdx.x, ty=blockIdx.y;
+    short twc=gridDim.x;
+    short x = tx * tw + threadIdx.x;
+    short y = ty * th + threadIdx.y;
+    if(x>=w||y>=h) return;
+    int ti = ty*twc+tx;
+
+    if(tileCnt[ti]<=0) return;
+    // printf("x: %d, y:%d\n", x, y);
+    float invWidth = 1.f / w;
+    float invHeight = 1.f / h;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(x) + 0.5f), invHeight * (static_cast<float>(y) + 0.5f));
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (y * w + x)]);
+    float4 existColor = *imgPtr;
+    __shared__ float3 p_shared[THREADS_PER_BLK];
+    __shared__ float rad_shared[THREADS_PER_BLK];
+    __shared__ float3 rgb_shared[THREADS_PER_BLK];
+
+    int e = tileCnt[ti] + tileOffset[ti];
+    int locali = threadIdx.y * tw + threadIdx.x;
+    for(int i=tileOffset[ti];i<e;i+=THREADS_PER_BLK){
+        int batch_size = min(THREADS_PER_BLK, e-i);
+        if(locali<batch_size){
+            int ci = circleIndex[i+locali];
+            rad_shared[locali] = cuConstRendererParams.radius[ci];
+            int ci3 = ci*3;
+            p_shared[locali] = *(float3*)(&cuConstRendererParams.position[ci3]);
+            rgb_shared[locali] = *(float3*)&(cuConstRendererParams.color[ci3]);
+        }
+        __syncthreads();
+        
+        for(int j=0;j<batch_size;j++){
+            if(isSnow){
+                shadeSnow(rad_shared[j], pixelCenterNorm, p_shared[j], &existColor);
+            }
+            else{
+                shadeNormal(rad_shared[j], rgb_shared[j], pixelCenterNorm, p_shared[j], &existColor);
+            }
+        }
+        __syncthreads();
+        
+    }
+    *imgPtr = existColor;
+}
+
+void CudaRenderer::render_tile_based(){
+    bool isSnow = sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME;
+    int width = image->width;
+    int height = image->height;
+    int blockSize = THREADS_PER_BLK;
+
+    // tile width, tile height
+    int tw=TILE_X , th=TILE_Y;
+    // tile height count, tile width count
+    int thc = (height+th-1)/th;
+    int twc = (width+tw-1)/tw;
+    int total_tile_count = thc * twc;
+    dim3 blockDim(tw, th);
+    dim3 gridDim(twc, thc);
+
+
+    cudaMemset(cudaDeviceTileCnt, 0, sizeof(int) * total_tile_count);
+    count_circles_per_tile<<<(numCircles + blockSize -1) / blockSize, blockSize>>>(tw, th, cudaDeviceTileCnt);
+    
+    
+    thrust::device_ptr<int> tile_cnt_ptr(cudaDeviceTileCnt);
+    thrust::device_ptr<int> tile_offset_ptr(cudaDeviceTileOffset);
+    thrust::exclusive_scan(tile_cnt_ptr, tile_cnt_ptr + total_tile_count, tile_offset_ptr);
+    
+    
+    fill_circle_index<<<(total_tile_count+blockSize-1)/blockSize, blockSize>>>(total_tile_count, cudaDeviceTileOffset, cudaDeviceCircleIndex);
+
+    if(isSnow){
+        render_tile2<true><<<gridDim, blockDim>>>(cudaDeviceTileCnt, cudaDeviceTileOffset, cudaDeviceCircleIndex);
+    }
+    else{
+        render_tile2<false><<<gridDim, blockDim>>>(cudaDeviceTileCnt, cudaDeviceTileOffset, cudaDeviceCircleIndex);
+    }
+}
+
+
+
 void
 CudaRenderer::render() {
 
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+    if(numCircles < 10){
+        render_pixel_parallel();
+    }
+    else if(useTileBased){
+        render_tile_based();
+    }
+    else{
+        render_sorted_pairs();
+    }
+    
+    return;
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
-    cudaDeviceSynchronize();
 }

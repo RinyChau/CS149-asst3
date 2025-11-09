@@ -7,6 +7,7 @@
 
 #include "circleRenderer.h"
 
+struct CUstream_st;
 
 class CudaRenderer : public CircleRenderer {
 
@@ -21,11 +22,27 @@ private:
     float* color;
     float* radius;
 
+    
     float* cudaDevicePosition;
     float* cudaDeviceVelocity;
     float* cudaDeviceColor;
     float* cudaDeviceRadius;
     float* cudaDeviceImageData;
+
+    bool useTileBased;
+    int* cudaDeviceTileCnt;
+    int* cudaDeviceTileOffset;
+    int* cudaDeviceCircleIndex;
+
+    int* cudaDeviceCircleCnt;
+    int* cudaDeviceCircleOffset;
+    long long* cudaDeviceTileCirclePair;
+    int* cudaDeviceStart;
+    int* cudaDeviceEnd;
+    // CUstream_st* stream;
+    
+    // int* start;
+    // int* end;
 
 public:
 
@@ -45,6 +62,12 @@ public:
     void advanceAnimation();
 
     void render();
+
+    void render_sorted_pairs();
+
+    void render_pixel_parallel();
+
+    void render_tile_based();
 
     void shadePixel(
         int circleIndex,
