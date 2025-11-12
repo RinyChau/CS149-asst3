@@ -154,6 +154,35 @@ Scan Score Table:
 -------------------------------------------------------------------------
 ```
 
+```
+-------------------------
+Scan Score Table:
+-------------------------
+-------------------------------------------------------------------------
+| Element Count   | Ref Time        | Student Time    | Score           |
+-------------------------------------------------------------------------
+| 1000000         | 0.545           | 0.361           | 1.25            |
+| 10000000        | 8.71            | 7.723           | 1.25            |
+| 20000000        | 17.478          | 15.397          | 1.25            |
+| 40000000        | 34.753          | 31.03           | 1.25            |
+-------------------------------------------------------------------------
+|                                   | Total score:    | 5.0/5.0         |
+-------------------------------------------------------------------------
+```
+
+```
+-------------------------------------------------------------------------
+| Element Count   | Ref Time        | Student Time    | Score           |
+-------------------------------------------------------------------------
+| 1000000         | 1.15            | 0.869           | 1.25            |
+| 10000000        | 11.776          | 11.05           | 1.25            |
+| 20000000        | 22.31           | 20.076          | 1.25            |
+| 40000000        | 42.619          | 38.106          | 1.25            |
+-------------------------------------------------------------------------
+|                                   | Total score:    | 5.0/5.0         |
+-------------------------------------------------------------------------
+```
+
 This part of the assignment is largely about getting more practice with writing CUDA and thinking in a data parallel manner, and not about performance tuning code. Getting full performance points on this part of the assignment should not require much (or really any) performance tuning, just a direct port of the algorithm pseudocode to CUDA. However, there's one trick: a naive implementation of scan might launch N CUDA threads for each iteration of the parallel loops in the pseudocode, and using conditional execution in the kernel to determine which threads actually need to do work. Such a solution will not be performant! (Consider the last outmost loop iteration of the upsweep phase, where only two threads would do work!). A full credit solution will only launch one CUDA thread for each iteration of the innermost parallel loops.
 
 **Test Harness:** By default, the test harness runs on a pseudo-randomly generated array that is the same every time
@@ -298,6 +327,26 @@ Score table:
 | micro2M         | 355.9104         | (F)             | 0               |
 --------------------------------------------------------------------------
 |                                    | Total score:    | 0/72            |
+--------------------------------------------------------------------------
+```
+
+```
+------------
+Score table:
+------------
+--------------------------------------------------------------------------
+| Scene Name      | Ref Time (T_ref) | Your Time (T)   | Score           |
+--------------------------------------------------------------------------
+| rgb             | 0.2511           | 0.2486          | 9               |
+| rand10k         | 3.8803           | 1.9522          | 9               |
+| rand100k        | 39.7163          | 14.981          | 9               |
+| pattern         | 0.3901           | 0.3905          | 9               |
+| snowsingle      | 24.6993          | 1.3214          | 9               |
+| biglittle       | 20.7217          | 19.4247         | 9               |
+| rand1M          | 191.9838         | 16.3226         | 9               |
+| micro2M         | 362.9151         | 8.123           | 9               |
+--------------------------------------------------------------------------
+|                                    | Total score:    | 72/72           |
 --------------------------------------------------------------------------
 ```
 
